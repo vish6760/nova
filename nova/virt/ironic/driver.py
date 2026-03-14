@@ -1068,6 +1068,10 @@ class IronicDriver(virt_driver.ComputeDriver):
                     vif_id_to_objects[name][vif_id] = p
 
         additional_links = []
+        LOG.debug('MAC DEBUG: base_metadata links=%(links)s '
+                  'vif_id_to_objects ports keys=%(ports)s',
+                  {'links': base_metadata.get('links'),
+                   'ports': list(vif_id_to_objects['ports'].keys())})
         for link in base_metadata['links']:
             vif_id = link['vif_id']
             if vif_id in vif_id_to_objects['portgroups']:
@@ -1101,8 +1105,21 @@ class IronicDriver(virt_driver.ComputeDriver):
             elif vif_id in vif_id_to_objects['ports']:
                 p = vif_id_to_objects['ports'][vif_id]
                 # Ironic updates neutron port's address during attachment
+                LOG.debug('MAC OVERRIDE: vif_id=%(vif)s '
+                          'ironic_port_mac=%(mac)s '
+                          'neutron_mac=%(nmac)s',
+                          {'vif': vif_id,
+                           'mac': p.address,
+                           'nmac': link.get('ethernet_mac_address')})
                 link.update({'ethernet_mac_address': p.address,
                              'type': 'phy'})
+            else:
+                LOG.debug('MAC LOOKUP MISS: vif_id=%(vif)s not found. '
+                          'ports=%(ports)s portgroups=%(pgs)s',
+                          {'vif': vif_id,
+                           'ports': list(vif_id_to_objects['ports'].keys()),
+                           'pgs': list(
+                               vif_id_to_objects['portgroups'].keys())})
 
         base_metadata['links'].extend(additional_links)
         return base_metadata
