@@ -1230,6 +1230,30 @@ class IronicDriver(virt_driver.ComputeDriver):
                    'power': power_msg,
                    'storage': storage_msg})
 
+        # NOTE(fix): Plug VIFs BEFORE generating the configdrive.
+        # When Ironic attaches the VIF, it updates the Neutron port's
+        # MAC address from the initial random value to the physical
+        # NIC MAC. We must do this first, then refresh
+        # network_info so the configdrive reflects the real MAC.
+        try:
+            self._plug_vifs(node, instance, network_info)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                LOG.error('Error plugging VIFs for instance %(instance)s '
+                          'on baremetal node %(node)s',
+                          {'instance': instance.uuid, 'node': node_id})
+                self._cleanup_deploy(node, instance, network_info)
+
+        # Refresh network_info after VIF plug so we get the physical MAC
+        # that Ironic has now written to the Neutron port.
+        try:
+            network_info = self.network_api.get_instance_nw_info(
+                context, instance)
+        except Exception as e:
+            LOG.warning('Failed to refresh network_info after VIF attach '
+                        'for instance %(instance)s: %(err)s',
+                        {'instance': instance.uuid, 'err': e})
+
         # Config drive
         configdrive_value = None
         if configdrive.required_by(instance):
@@ -1239,8 +1263,8 @@ class IronicDriver(virt_driver.ComputeDriver):
 
             try:
                 configdrive_value = self._generate_configdrive(
-                    context, instance, node, network_info, extra_md=extra_md,
-                    files=injected_files)
+                    context, instance, node, network_info,
+                    extra_md=extra_md, files=injected_files)
             except Exception as e:
                 with excutils.save_and_reraise_exception():
                     msg = "Failed to build configdrive: %s" % str(e)
@@ -1248,7 +1272,8 @@ class IronicDriver(virt_driver.ComputeDriver):
                     self._cleanup_deploy(node, instance, network_info)
 
             LOG.info("Config drive for instance %(instance)s on "
-                     "baremetal node %(node)s created.",
+                     "baremetal node %(node)s created with refreshed "
+                     "network_info.",
                      {'instance': instance['uuid'], 'node': node_id})
 
         # trigger the node deploy
@@ -1758,6 +1783,26 @@ class IronicDriver(virt_driver.ComputeDriver):
         self._add_instance_info_to_node(node, instance, image_meta,
                                         instance.flavor, metadata,
                                         preserve_ephemeral=preserve_ephemeral)
+
+        # rebuild() has the same MAC-mismatch bug — fix it here too.
+        # Plug VIFs before configdrive so Ironic can update Neutron port MACs.
+        try:
+            self._plug_vifs(node, instance, network_info)
+        except Exception:
+            with excutils.save_and_reraise_exception():
+                LOG.error('Error plugging VIFs for instance %(instance)s '
+                          'during rebuild on baremetal node %(node)s',
+                          {'instance': instance.uuid, 'node': node.uuid})
+                self._cleanup_deploy(node, instance, network_info)
+
+        # Refresh network_info after VIF plug to get physical NIC MACs.
+        try:
+            network_info = self.network_api.get_instance_nw_info(
+                context, instance)
+        except Exception as e:
+            LOG.warning('Failed to refresh network_info after VIF attach '
+                        'during rebuild for instance %(instance)s: %(err)s',
+                        {'instance': instance.uuid, 'err': e})
 
         # Config drive
         configdrive_value = None

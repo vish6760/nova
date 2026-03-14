@@ -112,6 +112,10 @@ class IronicDriverTestCase(test.NoDBTestCase):
             fixtures.MockPatchObject(self.driver, '_ironic_connection')).mock
 
         self.ctx = nova_context.get_admin_context()
+        self.refreshed_network_info = [mock.sentinel.refreshed_vif]
+        self.driver.network_api = mock.Mock()
+        self.driver.network_api.get_instance_nw_info.return_value = (
+            self.refreshed_network_info)
 
         # TODO(dustinc): Remove once all id/uuid usages are normalized.
         self.instance_id = uuidutils.generate_uuid()
@@ -1273,13 +1277,15 @@ class IronicDriverTestCase(test.NoDBTestCase):
     @mock.patch.object(ironic_driver.IronicDriver, '_wait_for_active')
     @mock.patch.object(ironic_driver.IronicDriver,
                        '_add_instance_info_to_node')
-    def _test_spawn(self, mock_aiitn, mock_wait_active,
-                    mock_avti, mock_looping, mock_save,
-                    mock_metadata, config_drive_value=None):
+    @mock.patch.object(ironic_driver.IronicDriver, '_plug_vifs')
+    def _test_spawn(self, mock_plug_vifs, mock_aiitn, mock_wait_active,
+                    mock_avti, mock_looping, mock_save, mock_metadata,
+                    config_drive_value=None):
         node_id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
         node = _get_cached_node(driver='fake', id=node_id)
         instance = fake_instance.fake_instance_obj(self.ctx, node=node_id)
         fake_flavor = objects.Flavor(ephemeral_gb=0)
+        initial_network_info = [mock.sentinel.initial_vif]
         mock_metadata.return_value = (
             ironic_utils.get_test_instance_driver_metadata(
                 flavor_ephemeralgb=0)
@@ -1295,7 +1301,8 @@ class IronicDriverTestCase(test.NoDBTestCase):
 
         image_meta = ironic_utils.get_test_image_meta()
 
-        self.driver.spawn(self.ctx, instance, image_meta, [], None, {})
+        self.driver.spawn(self.ctx, instance, image_meta, [], None, {},
+                          network_info=initial_network_info)
 
         self.mock_conn.get_node.assert_called_once_with(
             node_id, fields=ironic_driver._NODE_FIELDS,
@@ -1308,6 +1315,10 @@ class IronicDriverTestCase(test.NoDBTestCase):
             fake_flavor, test.MatchType(driver.InstanceDriverMetadata),
             block_device_info=None)
         mock_avti.assert_called_once_with(self.ctx, instance, None)
+        mock_plug_vifs.assert_called_once_with(
+            node, instance, initial_network_info)
+        self.driver.network_api.get_instance_nw_info.assert_called_once_with(
+            self.ctx, instance)
         self.mock_conn.set_node_provision_state.assert_called_once_with(
             node_id, 'active', config_drive=config_drive_value,
         )
@@ -1336,9 +1347,9 @@ class IronicDriverTestCase(test.NoDBTestCase):
         mock_configdrive.return_value = base64.b64encode(b'foo').decode()
         self._test_spawn(config_drive_value=mock_configdrive.return_value)
         # assert configdrive was generated
-        mock_configdrive.assert_called_once_with(mock.ANY, mock.ANY, mock.ANY,
-                                                 mock.ANY, extra_md={},
-                                                 files=[])
+        mock_configdrive.assert_called_once_with(
+            mock.ANY, mock.ANY, mock.ANY, self.refreshed_network_info,
+            extra_md={}, files=[])
 
     @mock.patch.object(ironic_driver.IronicDriver,
                        'get_instance_driver_metadata')
@@ -1609,7 +1620,9 @@ class IronicDriverTestCase(test.NoDBTestCase):
     @mock.patch.object(objects.Instance, 'save')
     @mock.patch.object(ironic_driver.IronicDriver, '_add_volume_target_info')
     @mock.patch.object(ironic_driver.IronicDriver, '_generate_configdrive')
-    def test_spawn_node_configdrive_fail(self, mock_configdrive, mock_avti,
+    @mock.patch.object(ironic_driver.IronicDriver, '_plug_vifs')
+    def test_spawn_node_configdrive_fail(self, mock_plug_vifs,
+                                         mock_configdrive, mock_avti,
                                          mock_save, mock_required_by,
                                          mock_metadata):
         mock_required_by.return_value = True
@@ -1617,6 +1630,7 @@ class IronicDriverTestCase(test.NoDBTestCase):
         node = _get_cached_node(driver='fake', id=node_id)
         flavor = ironic_utils.get_test_flavor()
         instance = fake_instance.fake_instance_obj(self.ctx, node=node_id)
+        initial_network_info = [mock.sentinel.initial_vif]
         instance.flavor = flavor
         mock_metadata.return_value = (
             ironic_utils.get_test_instance_driver_metadata())
@@ -1629,28 +1643,39 @@ class IronicDriverTestCase(test.NoDBTestCase):
         with mock.patch.object(self.driver, '_cleanup_deploy',
                                autospec=True) as mock_cleanup_deploy:
             self.assertRaises(test.TestingException, self.driver.spawn,
-                              self.ctx, instance, image_meta, [], None, {})
+                              self.ctx, instance, image_meta, [], None, {},
+                              network_info=initial_network_info)
 
         self.mock_conn.get_node.assert_called_once_with(
             node_id, fields=ironic_driver._NODE_FIELDS)
         self.mock_conn.validate_node.assert_called_once_with(
             node_id, required=None,
         )
-        mock_cleanup_deploy.assert_called_with(node, instance, None)
+        mock_plug_vifs.assert_called_once_with(
+            node, instance, initial_network_info)
+        self.driver.network_api.get_instance_nw_info.assert_has_calls([
+            mock.call(self.ctx, instance),
+            mock.call(self.ctx, instance),
+        ])
+        mock_cleanup_deploy.assert_called_with(
+            node, instance, self.refreshed_network_info)
 
     @mock.patch.object(ironic_driver.IronicDriver,
                        'get_instance_driver_metadata')
     @mock.patch.object(configdrive, 'required_by')
     @mock.patch.object(ironic_driver.IronicDriver, '_add_volume_target_info')
     @mock.patch.object(ironic_driver.IronicDriver, '_cleanup_deploy')
-    def test_spawn_node_trigger_deploy_fail(self, mock_cleanup_deploy,
-                                            mock_avti,
-                                            mock_required_by, mock_metadata):
+    @mock.patch.object(ironic_driver.IronicDriver, '_plug_vifs')
+    def test_spawn_node_trigger_deploy_fail(self, mock_plug_vifs,
+                                            mock_cleanup_deploy,
+                                            mock_avti, mock_required_by,
+                                            mock_metadata):
         mock_required_by.return_value = False
         node_id = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
         node = _get_cached_node(driver='fake', id=node_id)
         flavor = ironic_utils.get_test_flavor()
         instance = fake_instance.fake_instance_obj(self.ctx, node=node_id)
+        initial_network_info = [mock.sentinel.initial_vif]
         instance.flavor = flavor
         image_meta = ironic_utils.get_test_image_meta()
         mock_metadata.return_value = (
@@ -1667,6 +1692,7 @@ class IronicDriverTestCase(test.NoDBTestCase):
             sdk_exc.SDKException,
             self.driver.spawn,
             self.ctx, instance, image_meta, [], None, {},
+            network_info=initial_network_info,
         )
 
         self.mock_conn.get_node.assert_called_once_with(
@@ -1674,7 +1700,12 @@ class IronicDriverTestCase(test.NoDBTestCase):
         self.mock_conn.validate_node.assert_called_once_with(
             node_id, required=None,
         )
-        mock_cleanup_deploy.assert_called_once_with(node, instance, None)
+        mock_plug_vifs.assert_called_once_with(
+            node, instance, initial_network_info)
+        self.driver.network_api.get_instance_nw_info.assert_called_once_with(
+            self.ctx, instance)
+        mock_cleanup_deploy.assert_called_once_with(
+            node, instance, self.refreshed_network_info)
 
     @mock.patch.object(ironic_driver.IronicDriver,
                        'get_instance_driver_metadata')
@@ -1683,9 +1714,10 @@ class IronicDriverTestCase(test.NoDBTestCase):
     @mock.patch.object(objects.Instance, 'save')
     @mock.patch.object(ironic_driver.IronicDriver, '_add_volume_target_info')
     @mock.patch.object(ironic_driver.IronicDriver, '_wait_for_active')
+    @mock.patch.object(ironic_driver.IronicDriver, '_plug_vifs')
     def test_spawn_sets_default_ephemeral_device(self,
-                                                 mock_wait, mock_avti,
-                                                 mock_save,
+                                                 mock_plug_vifs, mock_wait,
+                                                 mock_avti, mock_save,
                                                  mock_looping,
                                                  mock_required_by,
                                                  mock_metadata):
@@ -1693,6 +1725,7 @@ class IronicDriverTestCase(test.NoDBTestCase):
         node_uuid = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
         flavor = ironic_utils.get_test_flavor(ephemeral_gb=1)
         instance = fake_instance.fake_instance_obj(self.ctx, node=node_uuid)
+        initial_network_info = [mock.sentinel.initial_vif]
         instance.flavor = flavor
         mock_metadata.return_value = (
             ironic_utils.get_test_instance_driver_metadata(
@@ -1701,7 +1734,10 @@ class IronicDriverTestCase(test.NoDBTestCase):
 
         image_meta = ironic_utils.get_test_image_meta()
 
-        self.driver.spawn(self.ctx, instance, image_meta, [], None, {})
+        self.driver.spawn(self.ctx, instance, image_meta, [], None, {},
+                          network_info=initial_network_info)
+        mock_plug_vifs.assert_called_once_with(
+            mock.ANY, instance, initial_network_info)
         self.assertTrue(mock_save.called)
         self.assertEqual('/dev/sda1', instance.default_ephemeral_device)
 
@@ -2276,8 +2312,10 @@ class IronicDriverTestCase(test.NoDBTestCase):
     @mock.patch.object(ironic_driver.IronicDriver,
                        '_add_instance_info_to_node')
     @mock.patch.object(objects.Instance, 'save')
-    def _test_rebuild(self, mock_save, mock_add_instance_info,
-                      mock_looping, mock_wait_active, mock_metadata,
+    @mock.patch.object(ironic_driver.IronicDriver, '_plug_vifs')
+    def _test_rebuild(self, mock_plug_vifs, mock_save,
+                      mock_add_instance_info, mock_looping,
+                      mock_wait_active, mock_metadata,
                       preserve=False):
         node_uuid = uuidutils.generate_uuid()
         node = _get_cached_node(id=node_uuid, instance_id=self.instance_id)
@@ -2285,6 +2323,7 @@ class IronicDriverTestCase(test.NoDBTestCase):
 
         image_meta = ironic_utils.get_test_image_meta()
         flavor = objects.Flavor(name='baremetal')
+        initial_network_info = [mock.sentinel.initial_vif]
 
         instance = fake_instance.fake_instance_obj(
             self.ctx, uuid=self.instance_uuid, node=node_uuid, flavor=flavor)
@@ -2302,6 +2341,7 @@ class IronicDriverTestCase(test.NoDBTestCase):
             context=self.ctx, instance=instance, image_meta=image_meta,
             injected_files=None, admin_password=None, allocations={},
             bdms=None, detach_block_devices=None, attach_block_devices=None,
+            network_info=initial_network_info,
             preserve_ephemeral=preserve)
 
         mock_save.assert_called_once_with(
@@ -2312,6 +2352,10 @@ class IronicDriverTestCase(test.NoDBTestCase):
             flavor,
             test.MatchType(driver.InstanceDriverMetadata),
             preserve_ephemeral=preserve)
+        mock_plug_vifs.assert_called_once_with(
+            node, instance, initial_network_info)
+        self.driver.network_api.get_instance_nw_info.assert_called_once_with(
+            self.ctx, instance)
         self.mock_conn.set_node_provision_state.assert_called_once_with(
             node_uuid, ironic_states.REBUILD, config_drive=mock.ANY,
         )
@@ -2344,7 +2388,8 @@ class IronicDriverTestCase(test.NoDBTestCase):
         self._test_rebuild()
         # assert configdrive was generated
         mock_configdrive.assert_called_once_with(
-            self.ctx, mock.ANY, mock.ANY, mock.ANY, extra_md={}, files=None)
+            self.ctx, mock.ANY, mock.ANY, self.refreshed_network_info,
+            extra_md={}, files=None)
 
     @mock.patch.object(ironic_driver.IronicDriver,
                        'get_instance_driver_metadata')
@@ -2353,7 +2398,9 @@ class IronicDriverTestCase(test.NoDBTestCase):
     @mock.patch.object(ironic_driver.IronicDriver,
                        '_add_instance_info_to_node')
     @mock.patch.object(objects.Instance, 'save')
-    def test_rebuild_with_configdrive_failure(self, mock_save,
+    @mock.patch.object(ironic_driver.IronicDriver, '_plug_vifs')
+    def test_rebuild_with_configdrive_failure(self, mock_plug_vifs,
+                                              mock_save,
                                               mock_add_instance_info,
                                               mock_required_by,
                                               mock_configdrive,
@@ -2380,7 +2427,12 @@ class IronicDriverTestCase(test.NoDBTestCase):
             context=self.ctx, instance=instance, image_meta=image_meta,
             injected_files=None, admin_password=None, allocations={},
             bdms=None, detach_block_devices=None,
-            attach_block_devices=None)
+            attach_block_devices=None,
+            network_info=[mock.sentinel.initial_vif])
+        mock_plug_vifs.assert_called_once_with(
+            node, instance, [mock.sentinel.initial_vif])
+        self.driver.network_api.get_instance_nw_info.assert_called_once_with(
+            self.ctx, instance)
 
     @mock.patch.object(ironic_driver.IronicDriver,
                        'get_instance_driver_metadata')
@@ -2389,10 +2441,10 @@ class IronicDriverTestCase(test.NoDBTestCase):
     @mock.patch.object(ironic_driver.IronicDriver,
                        '_add_instance_info_to_node')
     @mock.patch.object(objects.Instance, 'save')
-    def test_rebuild_failures(self, mock_save,
-                              mock_add_instance_info,
-                              mock_required_by, mock_configdrive,
-                              mock_metadata):
+    @mock.patch.object(ironic_driver.IronicDriver, '_plug_vifs')
+    def test_rebuild_failures(self, mock_plug_vifs, mock_save,
+                              mock_add_instance_info, mock_required_by,
+                              mock_configdrive, mock_metadata):
         node_uuid = uuidutils.generate_uuid()
         node = _get_cached_node(
             id=node_uuid, instance_id=self.instance_uuid)
@@ -2418,7 +2470,12 @@ class IronicDriverTestCase(test.NoDBTestCase):
             context=self.ctx, instance=instance, image_meta=image_meta,
             injected_files=None, admin_password=None, allocations={},
             bdms=None, detach_block_devices=None,
-            attach_block_devices=None)
+            attach_block_devices=None,
+            network_info=[mock.sentinel.initial_vif])
+        mock_plug_vifs.assert_called_once_with(
+            node, instance, [mock.sentinel.initial_vif])
+        self.driver.network_api.get_instance_nw_info.assert_called_once_with(
+            self.ctx, instance)
 
     def test_network_binding_host_id(self):
         node_uuid = uuidutils.generate_uuid()
