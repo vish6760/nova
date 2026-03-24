@@ -107,6 +107,7 @@ class IronicDriverTestCase(test.NoDBTestCase):
 
         self.driver = ironic_driver.IronicDriver(None)
         self.driver.virtapi = fake.FakeVirtAPI()
+        self.driver._network_api = mock.Mock()
 
         self.mock_conn = self.useFixture(
             fixtures.MockPatchObject(self.driver, '_ironic_connection')).mock
@@ -1329,15 +1330,23 @@ class IronicDriverTestCase(test.NoDBTestCase):
         # assert configdrive was not generated
         self.assertFalse(mock_configdrive.called)
 
+    @mock.patch.object(
+        ironic_driver.IronicDriver, '_refresh_network_info_for_configdrive')
     @mock.patch.object(ironic_driver.IronicDriver, '_generate_configdrive')
     @mock.patch.object(configdrive, 'required_by')
-    def test_spawn_with_configdrive(self, mock_required_by, mock_configdrive):
+    def test_spawn_with_configdrive(self, mock_required_by, mock_configdrive,
+                                    mock_refresh_nwinfo):
         mock_required_by.return_value = True
+        refreshed_network_info = mock.sentinel.refreshed_network_info
+        mock_refresh_nwinfo.return_value = refreshed_network_info
         mock_configdrive.return_value = base64.b64encode(b'foo').decode()
         self._test_spawn(config_drive_value=mock_configdrive.return_value)
+        mock_refresh_nwinfo.assert_called_once_with(
+            self.ctx, mock.ANY, None)
         # assert configdrive was generated
         mock_configdrive.assert_called_once_with(mock.ANY, mock.ANY, mock.ANY,
-                                                 mock.ANY, extra_md={},
+                                                 refreshed_network_info,
+                                                 extra_md={},
                                                  files=[])
 
     @mock.patch.object(ironic_driver.IronicDriver,
@@ -2336,15 +2345,23 @@ class IronicDriverTestCase(test.NoDBTestCase):
         mock_required_by.return_value = False
         self._test_rebuild(preserve=False)
 
+    @mock.patch.object(
+        ironic_driver.IronicDriver, '_refresh_network_info_for_configdrive')
     @mock.patch.object(ironic_driver.IronicDriver, '_generate_configdrive')
     @mock.patch.object(configdrive, 'required_by')
     def test_rebuild_with_configdrive(self, mock_required_by,
-                                      mock_configdrive):
+                                      mock_configdrive,
+                                      mock_refresh_nwinfo):
         mock_required_by.return_value = True
+        refreshed_network_info = mock.sentinel.refreshed_network_info
+        mock_refresh_nwinfo.return_value = refreshed_network_info
         self._test_rebuild()
+        mock_refresh_nwinfo.assert_called_once_with(
+            self.ctx, mock.ANY, None)
         # assert configdrive was generated
         mock_configdrive.assert_called_once_with(
-            self.ctx, mock.ANY, mock.ANY, mock.ANY, extra_md={}, files=None)
+            self.ctx, mock.ANY, mock.ANY, refreshed_network_info,
+            extra_md={}, files=None)
 
     @mock.patch.object(ironic_driver.IronicDriver,
                        'get_instance_driver_metadata')
@@ -2871,6 +2888,33 @@ class IronicDriverGenerateConfigDriveTestCase(test.NoDBTestCase):
 
         self.mock_conn = self.useFixture(
             fixtures.MockPatchObject(self.driver, '_ironic_connection')).mock
+        self.driver._network_api = mock.Mock()
+
+    def test_refresh_network_info_for_configdrive(self, mock_cd_builder,
+                                                  mock_instance_meta):
+        refreshed_network_info = mock.sentinel.refreshed_network_info
+        self.driver._network_api.get_instance_nw_info.return_value = (
+            refreshed_network_info)
+
+        actual = self.driver._refresh_network_info_for_configdrive(
+            self.ctx, self.instance, self.network_info)
+
+        self.assertIs(refreshed_network_info, actual)
+        self.driver._network_api.get_instance_nw_info.assert_called_once_with(
+            self.ctx, self.instance, force_refresh=True)
+
+    def test_refresh_network_info_for_configdrive_fallback(
+        self, mock_cd_builder, mock_instance_meta
+    ):
+        self.driver._network_api.get_instance_nw_info.side_effect = (
+            exception.NovaException())
+
+        actual = self.driver._refresh_network_info_for_configdrive(
+            self.ctx, self.instance, self.network_info)
+
+        self.assertIs(self.network_info, actual)
+        self.driver._network_api.get_instance_nw_info.assert_called_once_with(
+            self.ctx, self.instance, force_refresh=True)
 
     def test_generate_configdrive(self, mock_cd_builder, mock_instance_meta):
         mock_instance_meta.return_value = 'fake-instance'

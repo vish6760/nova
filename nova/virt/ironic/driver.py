@@ -45,6 +45,7 @@ from nova.console import type as console_type
 from nova import context as nova_context
 from nova import exception
 from nova.i18n import _
+from nova.network import neutron
 from nova import objects
 from nova.objects import external_event as external_event_obj
 from nova.objects import fields as obj_fields
@@ -191,6 +192,7 @@ class IronicDriver(virt_driver.ComputeDriver):
 
         self.node_cache = {}
         self.node_cache_time = 0
+        self._network_api = neutron.API()
         self.servicegroup_api = servicegroup.API()
 
         self._ironic_connection = None
@@ -1142,6 +1144,25 @@ class IronicDriver(virt_driver.ComputeDriver):
                 compressed.seek(0)
                 return base64.b64encode(compressed.read()).decode()
 
+    def _refresh_network_info_for_configdrive(
+        self, context, instance, network_info
+    ):
+        """Refresh network info after VIF attachment for config drive use.
+
+        Ironic plugs VIFs before spawn so Neutron may already have updated the
+        port MAC address to the physical NIC value by the time we build the
+        config drive. Refreshing here lets config drive metadata match the
+        later metadata service view.
+        """
+        try:
+            return self._network_api.get_instance_nw_info(
+                context, instance, force_refresh=True)
+        except Exception:
+            LOG.warning('Failed to refresh network info for config drive; '
+                        'using the cached network information instead.',
+                        instance=instance)
+            return network_info
+
     def spawn(self, context, instance, image_meta, injected_files,
               admin_password, allocations, network_info=None,
               block_device_info=None, power_on=True, accel_info=None):
@@ -1238,6 +1259,8 @@ class IronicDriver(virt_driver.ComputeDriver):
                 extra_md['admin_pass'] = admin_password
 
             try:
+                network_info = self._refresh_network_info_for_configdrive(
+                    context, instance, network_info)
                 configdrive_value = self._generate_configdrive(
                     context, instance, node, network_info, extra_md=extra_md,
                     files=injected_files)
@@ -1767,6 +1790,8 @@ class IronicDriver(virt_driver.ComputeDriver):
                 extra_md['admin_pass'] = admin_password
 
             try:
+                network_info = self._refresh_network_info_for_configdrive(
+                    context, instance, network_info)
                 configdrive_value = self._generate_configdrive(
                     context, instance, node, network_info, extra_md=extra_md,
                     files=injected_files)
